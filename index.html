@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visualisasi Risiko SPBC (Urban Analytics)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f1f5f9; }
+        #map { height: 65vh; border-radius: 0.5rem; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); z-index: 10; }
+        .risk-hotspot { background-color: #ef4444; color: white; }
+        .risk-medium { background-color: #f97316; color: white; }
+        .risk-low { background-color: #22c55e; color: white; }
+        .leaflet-popup-content-wrapper { border-radius: 0.5rem; }
+    </style>
+</head>
+<body class="p-6">
+
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-3xl font-bold text-gray-800 mb-2">Penerapan Urban Analytics: Visualisasi Risiko SPBC</h1>
+        <p class="text-lg text-gray-600 mb-6">Peta interaktif ini menampilkan hasil komputasi R-Score (diambil dari Google Sheets API Realtime) untuk memprioritaskan penilikan bangunan.</p>
+
+        <div id="map" class="mb-6"></div>
+
+        <div class="grid md:grid-cols-3 gap-6">
+            <div class="bg-white p-4 rounded-xl shadow-lg md:col-span-2">
+                <h2 class="text-xl font-semibold text-gray-800 mb-3 border-b pb-2">Legenda Risiko Penilikan (Skala Spreadsheet)</h2>
+                <div id="legend-list" class="flex flex-wrap gap-4">
+                    <div class="flex items-center space-x-2">
+                        <span class="w-4 h-4 rounded-full risk-hotspot border-2 border-red-700"></span>
+                        <span class="text-gray-700 font-medium">Hotspot ($\mathbf{R > 17}$)</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <span class="w-4 h-4 rounded-full risk-medium border-2 border-orange-700"></span>
+                        <span class="text-gray-700 font-medium">Menengah ($13 < \mathbf{R} \le 17$)</span>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <span class="w-4 h-4 rounded-full risk-low border-2 border-green-700"></span>
+                        <span class="text-gray-700 font-medium">Rendah ($\mathbf{R \le 13}$)</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white p-4 rounded-xl shadow-lg">
+                <h2 class="text-xl font-semibold text-gray-800 mb-3 border-b pb-2">Statistik Risiko</h2>
+                <div class="space-y-2">
+                    <div class="flex justify-between items-center text-gray-700">
+                        <span>Total Tugas Terverifikasi:</span>
+                        <span id="total-tugas" class="font-bold"></span>
+                    </div>
+                    <div class="flex justify-between items-center text-red-600">
+                        <span>Hotspot (> 17) Wajib Lapangan:</span>
+                        <span id="hotspot-count" class="font-bold"></span>
+                    </div>
+                    <div class="flex justify-between items-center text-gray-700">
+                        <span>Efisiensi Verifikasi Digital:</span>
+                        <span id="efficiency" class="font-bold text-blue-600"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <p id="loading-message" class="mt-4 text-center text-gray-500">Memuat data risiko dari server...</p>
+    </div>
+
+    <script>
+        // --- 1. ALAMAT API REAL-TIME ---
+        // GANTI URL DI BAWAH INI DENGAN URL WEB APP ANDA YANG BERAKHIR DENGAN /exec
+        const API_URL = 'URL_YANG_ANDA_SALIN_DARI_APPS_SCRIPT_BERAKHIR_DENGAN_/exec'; 
+
+        // Koordinat default (Tengah Karawang)
+        const centerLat = -6.3411; 
+        const centerLon = 107.2929; 
+        let map;
+        let hotspotCount = 0;
+
+        // Batas Wilayah Karawang (untuk Spatial Masking)
+        const karawangBoundary = [
+            [-6.5, 107.1], 
+            [-6.1, 107.1], 
+            [-6.1, 107.5], 
+            [-6.5, 107.5] 
+        ];
+
+        // 2. Fungsi Penentuan Risiko dan Warna (Menggunakan Skala Spreadsheet)
+        function getRiskLevel(score) {
+            if (score > 17) { // KRITIS > 17
+                hotspotCount++;
+                return { color: '#ef4444', level: 'Hotspot (Risiko KRITIS)' }; 
+            } else if (score > 13) { // SEDANG (13 - 17)
+                return { color: '#f97316', level: 'Menengah' }; 
+            } else { // RENDAH/AKAN BERHASIL (<= 13)
+                return { color: '#22c55e', level: 'Rendah (Verifikasi Digital)' }; 
+            }
+        }
+        
+        // 3. Fungsi Utama untuk Inisialisasi Peta
+        function initializeMap(data) {
+            document.getElementById('loading-message').style.display = 'none';
+
+            map = L.map('map').setView([centerLat, centerLon], 11); 
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; <a href="http://osm.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+
+            applySpatialMask(); 
+            
+            const totalTugas = data.length;
+
+            placeMarkers(data);
+
+            // Update Statistik
+            const lowRiskCount = totalTugas - hotspotCount;
+            const efficiency = (lowRiskCount / totalTugas) * 100;
+            document.getElementById('total-tugas').textContent = totalTugas;
+            document.getElementById('hotspot-count').textContent = hotspotCount;
+            document.getElementById('efficiency').textContent = `${efficiency.toFixed(1)}%`;
+        }
+
+        // 4. Fungsi Menambahkan Titik Data ke Peta
+        function placeMarkers(data) {
+            data.forEach(data => {
+                const risk = getRiskLevel(data.R_Score_Hitung);
+                
+                // Marker menggunakan CircleMarker, radius berdasarkan R-Score untuk visualisasi dampak
+                const circleMarker = L.circleMarker([data.latitude, data.longitude], {
+                    radius: data.R_Score_Hitung / 2, // Radius disesuaikan dengan skor R (Visualisasi Hotspot)
+                    fillColor: risk.color,
+                    color: '#0f172a', 
+                    weight: 1,
+                    opacity: 1,
+                    fillOpacity: 0.85
+                }).addTo(map);
+
+                // Konten Pop-up
+                circleMarker.bindPopup(`
+                    <div class="font-sans">
+                        <h3 class="font-bold text-lg mb-1 ${risk.color === '#ef4444' ? 'text-red-600' : 'text-gray-800'}">${risk.level}</h3>
+                        <p class="text-sm"><strong>Nama Pemilik:</strong> ${data.nama_pemilik}</p>
+                        <p class="text-sm"><strong>Kecamatan:</strong> ${data.kecamatan}</p>
+                        <p class="text-sm"><strong>R-Score Terhitung:</strong> <span class="font-mono font-bold">${data.R_Score_Hitung.toFixed(2)}</span></p>
+                        <hr class="my-1"/>
+                        <p class="text-xs text-gray-500">Aksi: ${risk.level === 'Hotspot (Risiko KRITIS)' ? 'SPK Penilikan Lapangan Wajib' : 'Verifikasi Administratif Lanjut'}</p>
+                    </div>
+                `);
+            });
+        }
+        
+        // 5. FUNGSI MASKING SPASIAL (untuk fokus wilayah Karawang)
+        function applySpatialMask() {
+            const karawangCoordsGeoJSON = karawangBoundary.map(coord => [coord[1], coord[0]]);
+            const globalBoundsCoords = [
+                [-180, -90], 
+                [180, -90],
+                [180, 90],
+                [-180, 90],
+                [-180, -90]
+            ];
+            
+            const maskGeoJSON = {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        globalBoundsCoords, 
+                        karawangCoordsGeoJSON.reverse()
+                    ]
+                }
+            };
+
+            L.geoJSON(maskGeoJSON, {
+                style: {
+                    fillColor: '#000', 
+                    fillOpacity: 0.5, 
+                    weight: 0,
+                    clickable: false
+                }
+            }).addTo(map);
+            
+            L.polygon(karawangBoundary, {
+                color: '#1e40af', 
+                weight: 5,
+                fill: false,
+                dashArray: '12, 8'
+            }).addTo(map);
+        }
+
+        // 6. Proses Sinkronisasi Data (KONEKSI REAL-TIME)
+        function fetchDataAndInitialize() {
+            document.getElementById('loading-message').textContent = 'Mengambil data real-time dari Google Sheets...';
+
+            // Perintah FETCH yang mengambil data dari URL API
+            fetch(API_URL)
+                .then(response => response.json()) 
+                .then(apiData => {
+                    initializeMap(apiData); 
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                    document.getElementById('loading-message').textContent = 'Gagal memuat data dari API. Cek URL atau izin script Apps Script.';
+                });
+        }
+
+        // Jalankan proses sinkronisasi saat halaman dimuat
+        fetchDataAndInitialize();
+    </script>
+</body>
+</html>
